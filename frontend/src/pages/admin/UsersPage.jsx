@@ -15,7 +15,7 @@ const ROLE_COLOR = {
 function UserModal({ user: editUser, departments, onClose, onSave, isMasterAdmin }) {
   const isEdit = !!editUser
   const [form, setForm] = useState({
-    name: '', email: '', password: '', role: 'employee', department: '',
+    name: '', email: '', password: '', role: 'employee',
     ...editUser,
     department: editUser?.department?._id || editUser?.department || '',
   })
