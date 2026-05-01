@@ -1,0 +1,85 @@
+version: "3.9"
+
+services:
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: tttn_backend
+    ports:
+      - "5000:5000"
+    environment:
+      - NODE_ENV=production
+      - PORT=5000
+      - MONGODB_URI=${MONGODB_URI}
+      - JWT_SECRET=${JWT_SECRET}
+      - JWT_REFRESH_SECRET=${JWT_REFRESH_SECRET}
+      - JWT_EXPIRES_IN=15m
+      - JWT_REFRESH_EXPIRES_IN=7d
+      - AI_SERVICE_URL=http://ai-service:8000
+      - UPLOAD_DIR=/app/uploads
+    volumes:
+      - uploads_data:/app/uploads
+    depends_on:
+      - ai-service
+    restart: unless-stopped
+    networks:
+      - tttn_network
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        - VITE_API_URL=http://localhost:5000/api
+        - VITE_AI_URL=http://localhost:8000
+    container_name: tttn_frontend
+    ports:
+      - "3000:80"
+    depends_on:
+      - backend
+    restart: unless-stopped
+    networks:
+      - tttn_network
+
+  ai-service:
+    build:
+      context: ./ai-service
+      dockerfile: Dockerfile
+    container_name: tttn_ai_service
+    ports:
+      - "8000:8000"
+    environment:
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - CHROMA_HOST=chromadb
+      - CHROMA_PORT=8001
+      - MONGODB_URI=${MONGODB_URI}
+    volumes:
+      - chroma_data:/app/chroma_data
+    depends_on:
+      - chromadb
+    restart: unless-stopped
+    networks:
+      - tttn_network
+
+  chromadb:
+    image: chromadb/chroma:latest
+    container_name: tttn_chromadb
+    ports:
+      - "8001:8000"
+    volumes:
+      - chroma_data:/chroma/chroma
+    environment:
+      - IS_PERSISTENT=TRUE
+      - ALLOW_RESET=TRUE
+    restart: unless-stopped
+    networks:
+      - tttn_network
+
+volumes:
+  chroma_data:
+  uploads_data:
+
+networks:
+  tttn_network:
+    driver: bridge

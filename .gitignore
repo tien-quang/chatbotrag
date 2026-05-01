@@ -1,0 +1,23 @@
+node_modules/
+.env
+*.log
+dist/
+build/
+uploads/
+chroma_data/
+__pycache__/
+*.pyc
+.DS_Store
+
+# secrets
+.env
+*.env
+backend/.env
+frontend/.env
+ai-service/.env
+
+# local venv
+venv/
+backend/venv/
+frontend/venv/
+ai-service/venv/
