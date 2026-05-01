@@ -22,6 +22,8 @@ const notificationRoutes = require("./routes/notifications");
 
 const app = express();
 
+app.set("trust proxy", 1);
+
 function buildCorsOriginValidator() {
   const raw = process.env.CORS_ORIGIN || "";
   const allowList = raw
