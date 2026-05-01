@@ -1,9 +1,8 @@
 import axios from 'axios'
-
-const BACKEND_URL = import.meta.env.VITE_BACKEND_URL || 'https://chatbotrag-production-aba9.up.railway.app'
+import { API_BASE_URL } from './config'
 
 const api = axios.create({
-  baseURL: `${BACKEND_URL}/api`,
+  baseURL: API_BASE_URL,
   timeout: 60000,
 })
 

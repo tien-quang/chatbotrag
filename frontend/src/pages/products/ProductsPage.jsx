@@ -2,6 +2,7 @@ import { useState, useEffect, useRef } from 'react'
 import { Plus, Search, Edit, Trash2, Package, ImageIcon, X } from 'lucide-react'
 import toast from 'react-hot-toast'
 import api from '../../services/api'
+import { BACKEND_URL } from '../../services/config'
 import { useAuth } from '../../context/AuthContext'
 import clsx from 'clsx'
 
@@ -35,7 +36,7 @@ function ProductModal({ product, onClose, onSave }) {
     stock: product?.stock ?? 0,
   })
   const [imgFile, setImgFile] = useState(null)
-  const BASE = (import.meta.env.VITE_API_URL || 'http://localhost:5000/api').replace('/api', '')
+  const BASE = BACKEND_URL
   const [imgPreview, setImgPreview] = useState(product?.images?.[0] ? (product.images[0].startsWith('http') ? product.images[0] : `${BASE}${product.images[0]}`) : null)
   const [loading, setLoading] = useState(false)
 
@@ -193,7 +194,7 @@ export default function ProductsPage() {
   }
 
   // Image URL helper
-  const BASE = (import.meta.env.VITE_API_URL || 'http://localhost:5000/api').replace('/api', '')
+  const BASE = BACKEND_URL
   const imgUrl = (p) => {
     if (!p.images?.[0]) return null
     const img = p.images[0]

@@ -3,6 +3,7 @@ import { useNavigate, Link } from 'react-router-dom'
 import { useAuth } from '../../context/AuthContext'
 import { Eye, EyeOff, UserPlus, Bot, Building2 } from 'lucide-react'
 import toast from 'react-hot-toast'
+import { API_BASE_URL } from '../../services/config'
 
 export default function RegisterPage() {
   const { register } = useAuth()
@@ -15,7 +16,7 @@ export default function RegisterPage() {
 
   useEffect(() => {
     // Use fetch directly to avoid auth interceptor issues on public endpoint
-    fetch('/api/departments/public')
+    fetch(`${API_BASE_URL}/departments/public`)
       .then(r => r.json())
       .then(data => {
         if (Array.isArray(data)) setDepartments(data)
