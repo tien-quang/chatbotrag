@@ -1,6 +1,6 @@
 /**
  * RAG Service - Retrieval Augmented Generation Pipeline
- * 
+ *
  * Flow:
  * 1. INDEXING: File → Extract Text → Chunk → OpenAI Embed → ChromaDB
  * 2. RETRIEVAL: Question → OpenAI Embed → ChromaDB Search → Top K chunks
@@ -77,7 +77,6 @@ async function extractText(filePath, fileType) {
 
 // ─── CHUNKING ─────────────────────────────────────────────────────────────────
 function chunkText(text, chunkSize = 800, overlap = 150) {
-  // Clean text
   const cleaned = text
     .replace(/\r\n/g, '\n')
     .replace(/\n{3,}/g, '\n\n')
@@ -92,7 +91,6 @@ function chunkText(text, chunkSize = 800, overlap = 150) {
   while (start < cleaned.length) {
     let end = start + chunkSize
 
-    // Try to break at sentence boundary
     if (end < cleaned.length) {
       const breakPoints = ['\n\n', '.\n', '. ', '\n', ' ']
       for (const bp of breakPoints) {
@@ -115,7 +113,6 @@ function chunkText(text, chunkSize = 800, overlap = 150) {
 // ─── EMBEDDING ────────────────────────────────────────────────────────────────
 async function embedTexts(texts) {
   const ai = getOpenAI()
-  // Batch up to 100 at a time
   const embeddings = []
   const batchSize = 50
 
@@ -154,7 +151,6 @@ async function indexDocument({ filePath, fileType, documentId, documentName, dep
   const chromaClient = getChroma()
   const colName = collectionName(departmentCode)
 
-  // Get or create collection
   let collection
   try {
     collection = await chromaClient.getOrCreateCollection({
@@ -170,15 +166,14 @@ async function indexDocument({ filePath, fileType, documentId, documentName, dep
     await collection.delete({ where: { document_id: documentId } })
   } catch {}
 
-  // Add new chunks
+  // FIX: Bỏ field chunk_text khỏi metadata — không dùng ở đâu, tốn storage
   const ids = chunks.map((_, i) => `${documentId}_chunk_${i}`)
-  const metadatas = chunks.map((chunk, i) => ({
+  const metadatas = chunks.map((_, i) => ({
     document_id: documentId,
     document_name: documentName,
     department_code: departmentCode,
     department_id: departmentId,
     chunk_index: i,
-    chunk_text: chunk.slice(0, 200), // preview
   }))
 
   await collection.add({
@@ -210,14 +205,13 @@ async function retrieveChunks({ question, departmentCode, topK = 5 }) {
   const chromaClient = getChroma()
   const colName = collectionName(departmentCode)
 
-  // Embed the question
   const [questionEmbedding] = await embedTexts([question])
 
   let collection
   try {
     collection = await chromaClient.getCollection({ name: colName })
   } catch {
-    return [] // No collection yet = no documents indexed
+    return []
   }
 
   const count = await collection.count()
@@ -241,7 +235,6 @@ async function retrieveChunks({ question, departmentCode, topK = 5 }) {
     })
   }
 
-  // Filter by relevance (distance < 1.5 means reasonably relevant)
   return chunks.filter(c => c.distance < 1.5)
 }
 
@@ -251,22 +244,23 @@ async function generateAnswer({ question, chunks, departmentName, systemPrompt, 
 
   const hasContext = chunks.length > 0
   const contextText = hasContext
-    ? chunks.map((c, i) => '[Nguon ' + (i+1) + ': ' + c.documentName + (c.departmentCode && c.departmentCode !== 'PRODUCTS' ? ' | PB: ' + c.departmentCode : '') + ']\n' + c.text).join('\n\n---\n\n')
+    ? chunks.map((c, i) =>
+        '[Nguon ' + (i + 1) + ': ' + c.documentName +
+        (c.departmentCode && c.departmentCode !== 'PRODUCTS' ? ' | PB: ' + c.departmentCode : '') +
+        ']\n' + c.text
+      ).join('\n\n---\n\n')
     : ''
 
   const baseSystemPrompt = systemPrompt ||
     `Bạn là trợ lý AI nội bộ${isMasterAdmin ? ' toàn hệ thống TTTN' : ` của phòng ${departmentName}`}. Nhiệm vụ của bạn là hỗ trợ tra cứu thông tin từ tài liệu nội bộ công ty.`
 
+  // FIX: Template literal đã được đóng đúng, bỏ comment // gây nhiễu cho GPT
   const ragSystemPrompt = `${baseSystemPrompt}
 
-// System prompt — AI trợ lý nội bộ
-
-Bạn là ai
 Bạn là trợ lý AI nội bộ của công ty, hỗ trợ nhân viên tìm kiếm thông tin từ tài liệu và dữ liệu nội bộ. Hãy trả lời như một đồng nghiệp am hiểu — lịch sự, rõ ràng, không rườm rà.
 
 Nguyên tắc trả lời
 Chỉ dựa vào TÀI LIỆU NỘI BỘ bên dưới để trả lời. Đọc kỹ toàn bộ nội dung, kể cả những đoạn diễn đạt khác cách trước khi kết luận không tìm thấy thông tin.
-
 Không suy đoán, không thêm thông tin từ bên ngoài.
 
 Xử lý từng tình huống
@@ -285,7 +279,7 @@ Giọng văn
 Tự nhiên, thân thiện, chuyên nghiệp. Không liệt kê cứng nhắc khi không cần thiết. Không lặp lại câu hỏi của người dùng. Trả lời ngắn nếu câu hỏi đơn giản — dài hơn khi thực sự cần thiết.
 
 Tài liệu nội bộ
-${hasContext ? contextText : 'Chưa có tài liệu nào được upload cho phòng ban này.'}
+${hasContext ? contextText : 'Chưa có tài liệu nào được upload cho phòng ban này.'}`
 
   const messages = [
     { role: 'system', content: ragSystemPrompt },
@@ -301,13 +295,12 @@ ${hasContext ? contextText : 'Chưa có tài liệu nào được upload cho ph�
     model: 'gpt-3.5-turbo',
     messages,
     max_tokens: 1500,
-    temperature: 0.1, // Low temperature = more factual, less creative
+    temperature: 0.1,
   })
 
   const answer = response.choices[0].message.content
   const tokens = response.usage?.total_tokens || 0
 
-  // Extract source documents cited - with department info
   const seenNames = new Set()
   const sources = []
   for (const c of chunks) {
@@ -326,23 +319,19 @@ ${hasContext ? contextText : 'Chưa có tài liệu nào được upload cho ph�
 }
 
 // ─── FULL RAG QUERY ───────────────────────────────────────────────────────────
-// departmentCode = 'ALL' means search across all departments (master_admin)
 async function ragQuery({ question, departmentCode, departmentName, systemPrompt, history, isMasterAdmin = false }) {
   let chunks = []
   let productChunks = []
 
   try {
     if (isMasterAdmin || departmentCode === 'ALL') {
-      // Master admin: search ALL department collections
       chunks = await retrieveAllChunks(question, 5)
       console.log(`[RAG] ALL depts: ${chunks.length} chunks`)
     } else {
-      // Regular: search only this department
       chunks = await retrieveChunks({ question, departmentCode, topK: 5 })
       console.log(`[RAG] Dept ${departmentCode}: ${chunks.length} chunks`)
     }
 
-    // Always search products
     productChunks = await retrieveProducts(question, 3)
     console.log(`[RAG] Products: ${productChunks.length} results`)
   } catch (e) {
@@ -366,7 +355,6 @@ async function ragQuery({ question, departmentCode, departmentName, systemPrompt
   return await generateAnswer({ question, chunks: allChunks, departmentName, systemPrompt, history, isMasterAdmin })
 }
 
-
 // ─── INDEX PRODUCT INTO CHROMA ────────────────────────────────────────────────
 async function indexProduct(product) {
   try {
@@ -384,7 +372,6 @@ async function indexProduct(product) {
       return
     }
 
-    // Delete old entry if updating
     try { await collection.delete({ where: { product_id: product._id.toString() } }) } catch {}
 
     const fmt = (n) => n ? new Intl.NumberFormat('vi-VN').format(n) + ' VNĐ' : ''
@@ -432,13 +419,11 @@ async function deleteProduct(productId) {
   }
 }
 
-// ─── RETRIEVE PRODUCTS FROM CHROMA ───────────────────────────────────────────
-// Search across ALL department collections (for master_admin)
+// ─── RETRIEVE ALL CHUNKS (master admin) ───────────────────────────────────────
 async function retrieveAllChunks(question, topK = 4) {
   const chromaClient = getChroma()
   const allChunks = []
 
-  // Get dept codes from MongoDB
   let deptCodes = ['HR', 'IT', 'SALES', 'ACCOUNTING', 'GENERAL']
   try {
     const mongoose = require('mongoose')
@@ -447,7 +432,6 @@ async function retrieveAllChunks(question, topK = 4) {
     if (depts.length > 0) deptCodes = depts.map(d => d.code)
   } catch {}
 
-  // Embed question once, reuse for all collections
   let qEmbed
   try {
     const [e] = await embedTexts([question])
@@ -498,6 +482,7 @@ async function retrieveAllChunks(question, topK = 4) {
   return allChunks.slice(0, topK * 2)
 }
 
+// ─── RETRIEVE PRODUCTS FROM CHROMA ───────────────────────────────────────────
 async function retrieveProducts(question, topK = 3) {
   try {
     const chromaClient = getChroma()
@@ -531,4 +516,14 @@ async function retrieveProducts(question, topK = 3) {
   }
 }
 
-module.exports = { indexDocument, deleteDocument, ragQuery, retrieveChunks, extractText, chunkText, indexProduct, deleteProduct, retrieveProducts }
+module.exports = {
+  indexDocument,
+  deleteDocument,
+  ragQuery,
+  retrieveChunks,
+  extractText,
+  chunkText,
+  indexProduct,
+  deleteProduct,
+  retrieveProducts,
+}
