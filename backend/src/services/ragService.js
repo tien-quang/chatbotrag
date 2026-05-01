@@ -260,12 +260,33 @@ async function generateAnswer({ question, chunks, departmentName, systemPrompt, 
   const ragSystemPrompt = `${baseSystemPrompt}
 
 === QUY TẮC BẮT BUỘC ===
-1. CHỈ trả lời dựa trên thông tin có trong TÀI LIỆU NỘI BỘ được cung cấp bên dưới.
-2. KHÔNG được sử dụng kiến thức bên ngoài hoặc tự suy đoán thông tin không có trong tài liệu.
-3. Nếu KHÔNG có thông tin trong tài liệu, hãy nói: "Không tìm thấy trong tài liệu nội bộ hiện có." rồi có thể trả lời ngắn từ hiểu biết chung hoặc gợi ý liên hệ phòng ban.
-4. Trả lời bằng tiếng Việt, rõ ràng, ngắn gọn và chính xác.
-5. Khi trả lời, LUÔN trích dẫn tên nguồn cụ thể ở cuối câu. Ví dụ: (Nguồn: Chiến lược tiếp thị - Phòng Kinh Doanh) hoặc (Nguồn: [Sản phẩm] MacBook M7). KHÔNG dùng 'Tài liệu 1', 'Nguồn 1'.
+1. CHỈ sử dụng thông tin có trong phần "TÀI LIỆU NỘI BỘ" để trả lời.
+2. KHÔNG được tự suy đoán hoặc bổ sung thông tin không có trong tài liệu.
+3. KHÔNG được sử dụng kiến thức bên ngoài để trả lời nội dung chính.
 
+4. Nếu KHÔNG tìm thấy thông tin phù hợp trong tài liệu:
+   - Trả lời: "Không tìm thấy trong tài liệu nội bộ hiện có."
+   - Sau đó, gợi ý NGẮN GỌN cho người dùng:
+     + Nên tham khảo ở đâu (ví dụ: website chính thức của công ty, phòng ban liên quan, hoặc nguồn phù hợp)
+     + KHÔNG cung cấp chi tiết nội dung từ kiến thức ngoài
+     + KHÔNG trả lời thay bằng kiến thức suy đoán
+
+5. Trả lời bằng tiếng Việt, rõ ràng, ngắn gọn, đúng trọng tâm.
+6. LUÔN trích dẫn nguồn cụ thể ở cuối mỗi ý.
+   - Ví dụ: (Nguồn: Phòng Kinh Doanh) hoặc (Nguồn: [Sản phẩm] MacBook M7)
+   - KHÔNG dùng các cách ghi chung chung như "Tài liệu 1", "Nguồn 1"
+
+7. Nếu có nhiều nguồn:
+   - Liệt kê đầy đủ các nguồn đã sử dụng
+   - Không gộp nguồn mơ hồ
+
+=== CÁCH TRẢ LỜI MONG MUỐN ===
+- Ưu tiên trả lời trực tiếp
+- Nếu câu hỏi mơ hồ → yêu cầu làm rõ (không đoán)
+- Nếu câu hỏi ngoài phạm vi tài liệu → từ chối + gợi ý thông minh
+
+=== TÀI LIỆU NỘI BỘ ===
+${hasContext ? contextText : 'Chưa có tài liệu nào được upload cho phòng ban này.'}
 ${hasContext ? `=== TÀI LIỆU NỘI BỘ ===\n${contextText}` : '=== KHÔNG CÓ TÀI LIỆU NỘI BỘ ===\nChưa có tài liệu nào được upload cho phòng ban này.'}`
 
   const messages = [
