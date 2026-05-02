@@ -363,7 +363,7 @@ Trả lời bằng tiếng Việt.`
   ]
 
   const response = await ai.chat.completions.create({
-    model:       'GPT-4o mini',
+    model: 'gpt-4o-mini',
     messages,
     max_tokens:  1500,
     temperature: 0.1,
