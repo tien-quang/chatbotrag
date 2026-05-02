@@ -7,9 +7,9 @@
  * 3. GENERATION: Question + Chunks → GPT-4o-mini → Answer
  *
  * Fixes:
- *  ✓ Distance threshold nới 1.5 → 1.8, fallback top-3 nếu không có chunk nào qua threshold
- *  ✓ Chunks tài liệu & sản phẩm được tách biệt rõ ràng trong context → GPT không nhầm nguồn
- *  ✓ System prompt chuẩn: ép GPT ghi đúng tên tài liệu / tên sản phẩm làm nguồn
+ *  ✓ Distance threshold 1.8, fallback top-3
+ *  ✓ Tài liệu & sản phẩm tách block riêng → GPT không nhầm nguồn
+ *  ✓ Prompt chuẩn RAG nội bộ: ngắn gọn, không dài dòng, không bịa
  *  ✓ Không dùng LangGraph
  */
 
@@ -19,11 +19,11 @@ const { OpenAI }       = require('openai')
 const { ChromaClient } = require('chromadb')
 
 // ─── Config ───────────────────────────────────────────────────────────────────
-const DIST_DOC      = 1.8   // threshold tài liệu
-const DIST_PROD     = 2.0   // threshold sản phẩm (tên thường ngắn nên xa hơn)
-const FALLBACK_TOP  = 3     // lấy top N gần nhất khi không chunk nào qua threshold
-const TOP_K_DOC     = 6
-const TOP_K_PROD    = 3
+const DIST_DOC     = 1.8
+const DIST_PROD    = 2.0
+const FALLBACK_TOP = 3
+const TOP_K_DOC    = 6
+const TOP_K_PROD   = 3
 
 // ─── Singletons ───────────────────────────────────────────────────────────────
 let _openai = null
@@ -47,21 +47,18 @@ function getChroma() {
   return _chroma
 }
 
-function colName(departmentCode) {
-  return `tttn_${departmentCode.toLowerCase()}_docs`
+function colName(deptCode) {
+  return `tttn_${deptCode.toLowerCase()}_docs`
 }
 
 // ─── TEXT EXTRACTION ──────────────────────────────────────────────────────────
 async function extractText(filePath, fileType) {
   const ext = (fileType || path.extname(filePath).slice(1)).toLowerCase()
-
   if (ext === 'pdf') {
-    const pdfParse = require('pdf-parse')
-    return (await pdfParse(fs.readFileSync(filePath))).text
+    return (await require('pdf-parse')(fs.readFileSync(filePath))).text
   }
   if (ext === 'docx') {
-    const mammoth = require('mammoth')
-    return (await mammoth.extractRawText({ path: filePath })).value
+    return (await require('mammoth').extractRawText({ path: filePath })).value
   }
   if (['txt', 'md', 'csv'].includes(ext)) {
     return fs.readFileSync(filePath, 'utf-8')
@@ -83,12 +80,9 @@ function chunkText(text, chunkSize = 800, overlap = 150) {
     .replace(/\n{3,}/g, '\n\n')
     .replace(/[ \t]{2,}/g, ' ')
     .trim()
-
   if (!cleaned) return []
-
   const chunks = []
   let start = 0
-
   while (start < cleaned.length) {
     let end = start + chunkSize
     if (end < cleaned.length) {
@@ -118,14 +112,14 @@ async function embedTexts(texts) {
 }
 
 // ─── INDEX DOCUMENT ───────────────────────────────────────────────────────────
-async function indexDocument({ filePath, fileType, documentId, documentName, departmentCode, departmentId }) {
+async function indexDocument({
+  filePath, fileType, documentId, documentName, departmentCode, departmentId,
+}) {
   console.log(`[RAG] Indexing: ${documentName}`)
-
   const rawText = await extractText(filePath, fileType)
   if (!rawText?.trim() || rawText.trim().length < 10) {
     throw new Error('Không trích xuất được nội dung từ file')
   }
-
   const chunks = chunkText(rawText)
   if (!chunks.length) throw new Error('File không có nội dung có thể xử lý')
   console.log(`[RAG] ${chunks.length} chunks`)
@@ -173,8 +167,6 @@ async function deleteDocument({ documentId, departmentCode }) {
 }
 
 // ─── RETRIEVE CHUNKS (1 phòng ban) ───────────────────────────────────────────
-// FIX: Không hard-filter ngay — lấy topK rồi ưu tiên relevant,
-//      fallback top FALLBACK_TOP nếu không có chunk nào đủ gần.
 async function retrieveChunks({ question, departmentCode, topK = TOP_K_DOC }) {
   let col
   try { col = await getChroma().getCollection({ name: colName(departmentCode) }) }
@@ -201,19 +193,18 @@ async function retrieveChunks({ question, departmentCode, topK = TOP_K_DOC }) {
   }))
 
   const relevant = chunks.filter(c => c.distance < DIST_DOC)
-  if (relevant.length === 0) {
+  if (!relevant.length) {
     console.log(`[RAG] Fallback top-${FALLBACK_TOP} (best dist=${chunks[0]?.distance?.toFixed(3)})`)
     return chunks.slice(0, FALLBACK_TOP)
   }
   return relevant
 }
 
-// ─── RETRIEVE ALL CHUNKS (Master Admin — tất cả phòng ban) ───────────────────
+// ─── RETRIEVE ALL CHUNKS (Master Admin) ──────────────────────────────────────
 async function retrieveAllChunks(question, topK = TOP_K_DOC) {
   let deptCodes = ['HR', 'IT', 'SALES', 'ACCOUNTING', 'GENERAL']
   try {
-    const mongoose   = require('mongoose')
-    const Department = mongoose.model('Department')
+    const Department = require('mongoose').model('Department')
     const depts      = await Department.find({}, 'code').lean()
     if (depts.length) deptCodes = depts.map(d => d.code)
   } catch {}
@@ -228,16 +219,13 @@ async function retrieveAllChunks(question, topK = TOP_K_DOC) {
       let col
       try { col = await getChroma().getCollection({ name: colName(code) }) }
       catch { continue }
-
       const count = await col.count()
       if (!count) continue
-
       const res = await col.query({
         queryEmbeddings: [qEmbed],
         nResults:        Math.min(topK, count),
         include:         ['documents', 'metadatas', 'distances'],
       })
-
       if (res.documents?.[0]) {
         res.documents[0].forEach((doc, i) => {
           all.push({
@@ -255,8 +243,7 @@ async function retrieveAllChunks(question, topK = TOP_K_DOC) {
   all.sort((a, b) => a.distance - b.distance)
   const relevant = all.filter(c => c.distance < DIST_DOC)
   const result   = relevant.length ? relevant : all.slice(0, FALLBACK_TOP)
-
-  console.log(`[RAG] retrieveAllChunks: ${result.length} chunks / ${deptCodes.length} depts`)
+  console.log(`[RAG] retrieveAllChunks: ${result.length} / ${deptCodes.length} depts`)
   return result.slice(0, topK * 2)
 }
 
@@ -266,25 +253,17 @@ async function retrieveProducts(question, topK = TOP_K_PROD) {
     let col
     try { col = await getChroma().getCollection({ name: 'tttn_products' }) }
     catch { return [] }
-
     const count = await col.count()
     if (!count) return []
-
     const [qEmbed] = await embedTexts([question])
     const res = await col.query({
       queryEmbeddings: [qEmbed],
       nResults:        Math.min(topK, count),
       include:         ['documents', 'metadatas', 'distances'],
     })
-
     if (!res.documents?.[0]) return []
-
     return res.documents[0]
-      .map((doc, i) => ({
-        text:     doc,
-        meta:     res.metadatas[0][i],
-        distance: res.distances[0][i] ?? 999,
-      }))
+      .map((doc, i) => ({ text: doc, meta: res.metadatas[0][i], distance: res.distances[0][i] ?? 999 }))
       .filter(p => p.distance < DIST_PROD)
   } catch (e) {
     console.warn('[RAG] retrieveProducts:', e.message)
@@ -297,60 +276,51 @@ async function generateAnswer({
   question, docChunks = [], productChunks = [],
   departmentName, systemPrompt, history = [], isMasterAdmin = false,
 }) {
-  const ai = getOpenAI()
-
   const hasDoc  = docChunks.length > 0
   const hasProd = productChunks.length > 0
   const hasAny  = hasDoc || hasProd
 
-  // ── Xây context tài liệu (tách riêng với sản phẩm để GPT không nhầm nguồn) ──
+  // ── Xây context: tách 2 block rõ ràng để GPT không nhầm nguồn ──
   let contextBlock = ''
-
   if (hasDoc) {
-    contextBlock += '=== TÀI LIỆU NỘI BỘ ===\n'
-    contextBlock += docChunks.map((c, i) => {
-      const deptTag = c.departmentCode ? ` [${c.departmentCode}]` : ''
-      return `--- Tài liệu: "${c.documentName}"${deptTag} ---\n${c.text}`
+    contextBlock += '--- TÀI LIỆU NỘI BỘ ---\n'
+    contextBlock += docChunks.map(c => {
+      const dept = c.departmentCode ? ` [${c.departmentCode}]` : ''
+      return `[${c.documentName}${dept}]\n${c.text}`
     }).join('\n\n')
     contextBlock += '\n\n'
   }
-
   if (hasProd) {
-    contextBlock += '=== DANH MỤC SẢN PHẨM ===\n'
-    contextBlock += productChunks.map(c => {
-      return `--- Sản phẩm: "${c.documentName}" ---\n${c.text}`
-    }).join('\n\n')
-    contextBlock += '\n'
+    contextBlock += '--- SẢN PHẨM ---\n'
+    contextBlock += productChunks.map(c => `[Sản phẩm: ${c.documentName}]\n${c.text}`).join('\n\n')
   }
 
   const base = systemPrompt
     || `Bạn là trợ lý AI nội bộ${isMasterAdmin ? ' toàn hệ thống TTTN' : ` của phòng ${departmentName}`}.`
 
-  // ── System prompt ──────────────────────────────────────────────────────────
-  // FIX KEY: Tách rõ 2 loại nguồn, ép GPT ghi đúng tên tài liệu / tên sản phẩm
-  const systemMsg = hasAny ? `${base}
+  // ── System prompt: ngắn gọn, chuẩn RAG nội bộ, không bịa, không dài dòng ──
+  const systemMsg = hasAny
+    ? `${base}
 
-Dưới đây là dữ liệu nội bộ được truy xuất liên quan đến câu hỏi. Hãy đọc kỹ và trả lời dựa trên nội dung này.
+Nhiệm vụ: Trả lời câu hỏi của nhân viên dựa trên dữ liệu nội bộ được cung cấp bên dưới.
 
-${contextBlock}
-=== HƯỚNG DẪN TRẢ LỜI ===
-1. Trả lời trực tiếp, rõ ràng dựa vào nội dung bên trên.
-2. Cuối mỗi ý quan trọng, ghi nguồn trong ngoặc tròn:
-   - Nếu thông tin lấy từ tài liệu → ghi: (Nguồn: tên_tài_liệu)
-     Ví dụ: (Nguồn: BÁO CÁO TTTN THẦY HIẾU NHÓM 13.docx)
-   - Nếu thông tin lấy từ sản phẩm → ghi: (Nguồn: Sản phẩm tên_sản_phẩm)
-     Ví dụ: (Nguồn: Sản phẩm MacBook M7)
-3. KHÔNG được nhầm lẫn nguồn: thông tin từ tài liệu KHÔNG được ghi nguồn là sản phẩm và ngược lại.
-4. Nếu thông tin một phần có, một phần không — nói rõ phần nào tìm thấy.
-5. Chỉ nói "không tìm thấy" khi dữ liệu trên thực sự không đề cập chủ đề này.
-6. Không bịa, không suy đoán ngoài dữ liệu được cung cấp.
-7. Trả lời bằng tiếng Việt, tự nhiên, thân thiện.`
+Quy tắc:
+- Trả lời ngắn gọn, đúng trọng tâm. Câu hỏi đơn giản → trả lời 1–3 câu. Câu hỏi phức tạp → trả lời đủ ý, không thừa.
+- Cuối câu trả lời ghi nguồn trong ngoặc tròn:
+    Tài liệu → (Nguồn: tên_file)         ví dụ: (Nguồn: BÁO CÁO TTTN NHÓM 13.docx)
+    Sản phẩm → (Nguồn: Sản phẩm tên_sp)  ví dụ: (Nguồn: Sản phẩm MacBook M7)
+- KHÔNG nhầm nguồn: thông tin từ tài liệu không được ghi nguồn là sản phẩm và ngược lại.
+- KHÔNG bịa, KHÔNG suy đoán ngoài dữ liệu được cung cấp.
+- KHÔNG thêm câu mời chào, câu kết "Nếu bạn cần thêm...", hay bất kỳ lời dẫn không cần thiết.
+- Nếu dữ liệu chỉ có một phần liên quan, trả lời phần đó và nói rõ phần còn lại không có trong tài liệu.
 
-  : `${base}
+${contextBlock}`
 
-Không tìm thấy tài liệu hay sản phẩm nào liên quan trong hệ thống nội bộ.
-Hãy thông báo lịch sự và gợi ý người dùng liên hệ bộ phận phụ trách hoặc Admin.
-Trả lời bằng tiếng Việt.`
+    : `${base}
+
+Không tìm thấy thông tin liên quan trong tài liệu nội bộ.
+Hãy trả lời ngắn gọn: thông báo không có dữ liệu, gợi ý người dùng liên hệ Admin hoặc bộ phận phụ trách, hoặc tự tra cứu bên ngoài nếu cần.
+KHÔNG thêm lời dẫn thừa. Trả lời bằng tiếng Việt.`
 
   const messages = [
     { role: 'system', content: systemMsg },
@@ -361,14 +331,14 @@ Trả lời bằng tiếng Việt.`
     { role: 'user', content: question },
   ]
 
-  const response = await ai.chat.completions.create({
+  const response = await getOpenAI().chat.completions.create({
     model:       'gpt-4o-mini',
     messages,
-    max_tokens:  1500,
+    max_tokens:  800,   // giới hạn để tránh trả lời dài dòng
     temperature: 0.1,
   })
 
-  const answer = response.choices[0].message.content
+  const answer = response.choices[0].message.content.trim()
   const tokens = response.usage?.total_tokens || 0
 
   // Dedup sources — tài liệu trước, sản phẩm sau
@@ -398,7 +368,6 @@ async function ragQuery({
   let productChunks = []
 
   try {
-    // ── Lấy chunks tài liệu ──
     if (isMasterAdmin || departmentCode === 'ALL') {
       docChunks = await retrieveAllChunks(question, TOP_K_DOC)
       console.log(`[RAG] ALL depts: ${docChunks.length} doc chunks`)
@@ -407,9 +376,8 @@ async function ragQuery({
       console.log(`[RAG] Dept ${departmentCode}: ${docChunks.length} doc chunks`)
     }
 
-    // ── Lấy chunks sản phẩm ──
-    const rawProdChunks = await retrieveProducts(question, TOP_K_PROD)
-    productChunks = rawProdChunks.map(p => ({
+    const rawProds = await retrieveProducts(question, TOP_K_PROD)
+    productChunks  = rawProds.map(p => ({
       text:           p.text,
       documentName:   p.meta?.name || 'Sản phẩm',
       documentId:     p.meta?.product_id,
@@ -429,13 +397,8 @@ async function ragQuery({
   }
 
   return generateAnswer({
-    question,
-    docChunks,
-    productChunks,
-    departmentName,
-    systemPrompt,
-    history,
-    isMasterAdmin,
+    question, docChunks, productChunks,
+    departmentName, systemPrompt, history, isMasterAdmin,
   })
 }
 
@@ -443,10 +406,8 @@ async function ragQuery({
 async function indexProduct(product) {
   try {
     const col = await getChroma().getOrCreateCollection({
-      name:     'tttn_products',
-      metadata: { type: 'products' },
+      name: 'tttn_products', metadata: { type: 'products' },
     })
-
     try { await col.delete({ where: { product_id: product._id.toString() } }) } catch {}
 
     const fmt  = n => (n && n > 0) ? new Intl.NumberFormat('vi-VN').format(n) + ' VNĐ' : 'Liên hệ'
@@ -461,7 +422,6 @@ async function indexProduct(product) {
     ].filter(Boolean).join('\n')
 
     const [embedding] = await embedTexts([text])
-
     await col.add({
       ids:        [product._id.toString()],
       embeddings: [embedding],
