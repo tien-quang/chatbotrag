@@ -341,7 +341,7 @@ ${hasContext ? `=== TÀI LIỆU NỘI BỘ ===\n${contextText}` : '=== KHÔNG C�
   ]
 
   const response = await ai.chat.completions.create({
-    model: 'gpt-4.o-mini',
+    model: 'gpt-4o-mini',
     messages,
     max_tokens: 1500,
     temperature: 0.1, // Low temperature = more factual, less creative
