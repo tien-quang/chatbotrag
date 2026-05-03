@@ -1,144 +1,469 @@
+'use strict';
 /**
- * RAG Service - Retrieval Augmented Generation Pipeline
+ * backend/src/services/ragService.js
  *
- * Flow:
- * 1. INDEXING  : File → Extract Text → Chunk → OpenAI Embed → ChromaDB
- * 2. RETRIEVAL : Question → OpenAI Embed → ChromaDB Search → Top K chunks
- * 3. GENERATION: Question + Chunks → GPT-4o-mini → Answer
- *
- * Fixes:
- *  ✓ Distance threshold 1.8, fallback top-3
- *  ✓ Tài liệu & sản phẩm tách block riêng → GPT không nhầm nguồn
- *  ✓ Prompt chuẩn RAG nội bộ: ngắn gọn, không dài dòng, không bịa
- *  ✓ Không dùng LangGraph
+ * RAG Pipeline — không LangGraph, retrieval thông minh
+ * ──────────────────────────────────────────────────────
+ * Fix:
+ *  ✓ Context expansion: câu hỏi ngắn/mơ hồ được làm rõ từ lịch sử
+ *  ✓ Fallback thông minh: không filter chặt, lấy best-available
+ *  ✓ Chat Toàn Hệ Thống: không bị dính dept label
+ *  ✓ Prompt chuẩn: ngắn gọn, ghi nguồn đúng, không bịa
+ *  ✓ Tách block tài liệu / sản phẩm rõ ràng
  */
 
-const fs   = require('fs')
-const path = require('path')
-const { OpenAI }       = require('openai')
-const { ChromaClient } = require('chromadb')
+const fs   = require('fs');
+const path = require('path');
+const { OpenAI }       = require('openai');
+const { ChromaClient } = require('chromadb');
 
-// ─── Config ───────────────────────────────────────────────────────────────────
-const DIST_DOC     = 1.8
-const DIST_PROD    = 2.0
-const FALLBACK_TOP = 3
-const TOP_K_DOC    = 6
-const TOP_K_PROD   = 3
+// ── Config ────────────────────────────────────────────────────────────
+const DIST_DOC     = 1.8;
+const DIST_PROD    = 2.0;
+const FALLBACK_TOP = 3;
+const TOP_K_DOC    = 6;
+const TOP_K_PROD   = 3;
+const CHUNK_SIZE   = 800;
+const OVERLAP      = 150;
 
-// ─── Singletons ───────────────────────────────────────────────────────────────
-let _openai = null
-let _chroma = null
+// ── Singletons ────────────────────────────────────────────────────────
+let _openai = null;
+let _chroma = null;
 
 function getOpenAI() {
   if (!_openai) {
-    const apiKey = process.env.OPENAI_API_KEY
-    if (!apiKey || apiKey.startsWith('sk-your') || apiKey === 'sk-proj-your-key-here') {
-      throw new Error('OPENAI_API_KEY chưa được cấu hình trong file .env')
+    const apiKey = process.env.OPENAI_API_KEY;
+    if (!apiKey || apiKey.startsWith('sk-your')) {
+      throw new Error('OPENAI_API_KEY chưa được cấu hình');
     }
-    _openai = new OpenAI({ apiKey })
+    _openai = new OpenAI({ apiKey });
   }
-  return _openai
+  return _openai;
 }
 
 function getChroma() {
   if (!_chroma) {
-    _chroma = new ChromaClient({ path: process.env.CHROMA_URL || 'http://localhost:8000' })
+    _chroma = new ChromaClient({ path: process.env.CHROMA_URL || 'http://localhost:8000' });
   }
-  return _chroma
+  return _chroma;
 }
 
-function colName(deptCode) {
-  return `tttn_${deptCode.toLowerCase()}_docs`
-}
+const toColName = (code) => `tttn_${code.toLowerCase()}_docs`;
 
-// ─── TEXT EXTRACTION ──────────────────────────────────────────────────────────
+// ══════════════════════════════════════════════════════════════════════
+// TEXT EXTRACTION
+// ══════════════════════════════════════════════════════════════════════
 async function extractText(filePath, fileType) {
-  const ext = (fileType || path.extname(filePath).slice(1)).toLowerCase()
+  const ext = (fileType || path.extname(filePath).slice(1)).toLowerCase();
   if (ext === 'pdf') {
-    return (await require('pdf-parse')(fs.readFileSync(filePath))).text
+    return (await require('pdf-parse')(fs.readFileSync(filePath))).text;
   }
   if (ext === 'docx') {
-    return (await require('mammoth').extractRawText({ path: filePath })).value
+    return (await require('mammoth').extractRawText({ path: filePath })).value;
   }
   if (['txt', 'md', 'csv'].includes(ext)) {
-    return fs.readFileSync(filePath, 'utf-8')
+    return fs.readFileSync(filePath, 'utf-8');
   }
   if (['xlsx', 'xls'].includes(ext)) {
-    const XLSX = require('xlsx')
-    const wb   = XLSX.readFile(filePath)
+    const XLSX = require('xlsx');
+    const wb   = XLSX.readFile(filePath);
     return wb.SheetNames
       .map(n => `[Sheet: ${n}]\n${XLSX.utils.sheet_to_csv(wb.Sheets[n])}`)
-      .join('\n\n')
+      .join('\n\n');
   }
-  throw new Error(`Định dạng file "${ext}" chưa được hỗ trợ`)
+  throw new Error(`Định dạng file ".${ext}" chưa được hỗ trợ`);
 }
 
-// ─── CHUNKING ─────────────────────────────────────────────────────────────────
-function chunkText(text, chunkSize = 800, overlap = 150) {
+// ══════════════════════════════════════════════════════════════════════
+// CHUNKING
+// ══════════════════════════════════════════════════════════════════════
+function chunkText(text, chunkSize = CHUNK_SIZE, overlap = OVERLAP) {
   const cleaned = text
     .replace(/\r\n/g, '\n')
     .replace(/\n{3,}/g, '\n\n')
     .replace(/[ \t]{2,}/g, ' ')
-    .trim()
-  if (!cleaned) return []
-  const chunks = []
-  let start = 0
+    .trim();
+  if (!cleaned) return [];
+  const chunks = [];
+  let start = 0;
   while (start < cleaned.length) {
-    let end = start + chunkSize
+    let end = start + chunkSize;
     if (end < cleaned.length) {
       for (const bp of ['\n\n', '.\n', '. ', '\n', ' ']) {
-        const idx = cleaned.lastIndexOf(bp, end)
-        if (idx > start + chunkSize * 0.5) { end = idx + bp.length; break }
+        const idx = cleaned.lastIndexOf(bp, end);
+        if (idx > start + chunkSize * 0.5) { end = idx + bp.length; break; }
       }
     }
-    const chunk = cleaned.slice(start, Math.min(end, cleaned.length)).trim()
-    if (chunk.length > 50) chunks.push(chunk)
-    start = end - overlap
+    const chunk = cleaned.slice(start, Math.min(end, cleaned.length)).trim();
+    if (chunk.length > 50) chunks.push(chunk);
+    start = end - overlap;
   }
-  return chunks
+  return chunks;
 }
 
-// ─── EMBEDDING ────────────────────────────────────────────────────────────────
+// ══════════════════════════════════════════════════════════════════════
+// EMBEDDING
+// ══════════════════════════════════════════════════════════════════════
 async function embedTexts(texts) {
-  const embeddings = []
+  const all = [];
   for (let i = 0; i < texts.length; i += 50) {
     const res = await getOpenAI().embeddings.create({
       model: 'text-embedding-3-small',
       input: texts.slice(i, i + 50),
-    })
-    embeddings.push(...res.data.map(e => e.embedding))
+    });
+    all.push(...res.data.map(e => e.embedding));
   }
-  return embeddings
+  return all;
 }
 
-// ─── INDEX DOCUMENT ───────────────────────────────────────────────────────────
+// ══════════════════════════════════════════════════════════════════════
+// CONTEXT-AWARE QUERY EXPANSION
+// ══════════════════════════════════════════════════════════════════════
+/**
+ * Vấn đề: User hỏi "tiến mssv là gì?" hoặc "còn hùng thì sao?"
+ * → Câu hỏi ngắn, mơ hồ → ChromaDB không tìm được
+ *
+ * Fix: dùng GPT để viết lại câu hỏi đầy đủ dựa trên lịch sử hội thoại
+ * "còn hùng?" + history["mssv của huỳnh quang tiến là gì"] 
+ *   → "MSSV của Hùng là gì?"
+ */
+async function expandQuestion(question, history) {
+  // Không cần expand nếu câu hỏi đã rõ ràng hoặc không có history
+  if (!history || history.length === 0) return question;
+  if (question.length > 50) return question; // đủ dài rồi
+
+  // Lấy 6 turns gần nhất để làm context
+  const ctx = history
+    .slice(-6)
+    .map(m => `${m.role === 'user' ? 'Người dùng' : 'AI'}: ${m.content.slice(0, 150)}`)
+    .join('\n');
+
+  try {
+    const res = await getOpenAI().chat.completions.create({
+      model: 'gpt-3.5-turbo',
+      temperature: 0,
+      max_tokens: 80,
+      messages: [{
+        role: 'user',
+        content: `Dựa vào lịch sử hội thoại bên dưới, hãy viết lại câu hỏi cuối thành 1 câu hoàn chỉnh, rõ nghĩa bằng tiếng Việt. Chỉ trả về câu hỏi, không giải thích.
+
+Lịch sử:
+${ctx}
+
+Câu hỏi cần viết lại: "${question}"`,
+      }],
+    });
+
+    const expanded = res.choices[0].message.content
+      .trim()
+      .replace(/^["']|["']$/g, '');
+
+    if (expanded && expanded !== question) {
+      console.log(`[RAG] Expand: "${question}" → "${expanded}"`);
+      return expanded;
+    }
+  } catch (e) {
+    console.warn('[RAG] expandQuestion error:', e.message);
+  }
+  return question;
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// CHROMA QUERY HELPER
+// ══════════════════════════════════════════════════════════════════════
+async function queryChromaCollection(colName, queryEmbedding, topK) {
+  let col;
+  try {
+    col = await getChroma().getCollection({ name: colName });
+  } catch {
+    return []; // collection chưa có
+  }
+
+  const count = await col.count();
+  if (!count) return [];
+
+  const res = await col.query({
+    queryEmbeddings: [queryEmbedding],
+    nResults:        Math.min(topK, count),
+    include:         ['documents', 'metadatas', 'distances'],
+  });
+
+  if (!res.documents?.[0]?.length) return [];
+
+  return res.documents[0].map((doc, i) => ({
+    text:           doc,
+    documentName:   res.metadatas[0][i]?.document_name   || colName,
+    documentId:     res.metadatas[0][i]?.document_id     || '',
+    departmentCode: res.metadatas[0][i]?.department_code || '',
+    distance:       res.distances[0][i] ?? 999,
+    isProduct:      false,
+  }));
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// RETRIEVE CHUNKS — 1 phòng ban
+// ══════════════════════════════════════════════════════════════════════
+async function retrieveChunks({ question, departmentCode, topK = TOP_K_DOC }) {
+  const [qEmbed] = await embedTexts([question]);
+  const chunks   = await queryChromaCollection(toColName(departmentCode), qEmbed, topK);
+
+  const relevant = chunks.filter(c => c.distance < DIST_DOC);
+  if (relevant.length > 0) return relevant;
+
+  // Fallback: nếu không có chunk nào đủ gần → lấy top-3 tốt nhất vẫn còn hơn không có gì
+  if (chunks.length > 0) {
+    console.log(`[RAG] Dept ${departmentCode}: fallback top-${FALLBACK_TOP} (best dist=${chunks[0].distance.toFixed(3)})`);
+    return chunks.slice(0, FALLBACK_TOP);
+  }
+  return [];
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// RETRIEVE ALL CHUNKS — Master Admin (tất cả phòng ban)
+// ══════════════════════════════════════════════════════════════════════
+async function retrieveAllChunks(question, topK = TOP_K_DOC) {
+  // Lấy danh sách dept codes từ MongoDB
+  let deptCodes = ['HR', 'IT', 'SALES', 'ACCOUNTING', 'GENERAL'];
+  try {
+    const Department = require('mongoose').model('Department');
+    const depts      = await Department.find({ isActive: true }, 'code').lean();
+    if (depts.length) deptCodes = depts.map(d => d.code);
+  } catch {}
+
+  // Embed câu hỏi 1 lần duy nhất, dùng lại cho tất cả collections
+  let qEmbed;
+  try {
+    [qEmbed] = await embedTexts([question]);
+  } catch (e) {
+    console.warn('[RAG] embed failed:', e.message);
+    return [];
+  }
+
+  // Query TẤT CẢ collections song song
+  const results = await Promise.all(
+    deptCodes.map(code => queryChromaCollection(toColName(code), qEmbed, topK))
+  );
+
+  const all = results.flat();
+  all.sort((a, b) => a.distance - b.distance);
+
+  const relevant = all.filter(c => c.distance < DIST_DOC);
+  const result   = relevant.length ? relevant : all.slice(0, FALLBACK_TOP);
+
+  console.log(`[RAG] AllChunks: ${result.length} chunks / ${deptCodes.length} depts`);
+  return result.slice(0, topK * 2);
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// RETRIEVE PRODUCTS
+// ══════════════════════════════════════════════════════════════════════
+async function retrieveProducts(question, topK = TOP_K_PROD) {
+  try {
+    const [qEmbed] = await embedTexts([question]);
+    const chunks   = await queryChromaCollection('tttn_products', qEmbed, topK);
+
+    const relevant = chunks.filter(c => c.distance < DIST_PROD);
+    return (relevant.length ? relevant : chunks.slice(0, FALLBACK_TOP))
+      .map(c => ({ text: c.text, meta: { name: c.documentName, product_id: c.documentId }, distance: c.distance }));
+  } catch (e) {
+    console.warn('[RAG] retrieveProducts:', e.message);
+    return [];
+  }
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// GENERATE ANSWER
+// ══════════════════════════════════════════════════════════════════════
+async function generateAnswer({
+  question, originalQuestion,
+  docChunks = [], productChunks = [],
+  departmentName, systemPrompt,
+  history = [], isMasterAdmin = false,
+}) {
+  const hasDoc  = docChunks.length > 0;
+  const hasProd = productChunks.length > 0;
+  const hasAny  = hasDoc || hasProd;
+
+  // ── Build context: tách 2 block rõ ràng ──────────────────────────
+  let contextBlock = '';
+
+  if (hasDoc) {
+    contextBlock += '--- TÀI LIỆU NỘI BỘ ---\n';
+    contextBlock += docChunks.map(c => {
+      // Chỉ hiện dept label khi chat toàn hệ thống để phân biệt nguồn
+      const deptLabel = (isMasterAdmin && c.departmentCode)
+        ? ` [${c.departmentCode}]`
+        : '';
+      return `[${c.documentName}${deptLabel}]\n${c.text}`;
+    }).join('\n\n');
+    contextBlock += '\n\n';
+  }
+
+  if (hasProd) {
+    contextBlock += '--- SẢN PHẨM ---\n';
+    contextBlock += productChunks.map(c =>
+      `[Sản phẩm: ${c.documentName}]\n${c.text}`
+    ).join('\n\n');
+  }
+
+  // ── System prompt ─────────────────────────────────────────────────
+  const base = systemPrompt
+    || (isMasterAdmin
+      ? 'Bạn là trợ lý AI nội bộ toàn hệ thống TTTN.'
+      : `Bạn là trợ lý AI nội bộ của phòng ${departmentName}.`);
+
+  const systemMsg = hasAny
+    ? `${base}
+
+Nhiệm vụ: Trả lời câu hỏi của nhân viên dựa trên dữ liệu nội bộ bên dưới.
+
+Quy tắc:
+- Trả lời ngắn gọn, đúng trọng tâm. Câu đơn giản → 1-3 câu. Câu phức tạp → trả lời đủ, không thừa.
+- Cuối câu trả lời ghi nguồn trong ngoặc tròn:
+    Từ tài liệu  → (Nguồn: tên_file.docx)
+    Từ sản phẩm → (Nguồn: Sản phẩm tên_sp)
+- KHÔNG nhầm nguồn giữa tài liệu và sản phẩm.
+- KHÔNG bịa, KHÔNG suy đoán ngoài dữ liệu được cung cấp.
+- KHÔNG thêm câu mời chào hay lời dẫn thừa.
+- Nếu chỉ có một phần thông tin → trả lời phần đó, nói rõ phần còn lại không có.
+
+${contextBlock}`
+    : `${base}
+
+Không tìm thấy thông tin liên quan trong tài liệu nội bộ. Trả lời ngắn gọn: thông báo không có dữ liệu. Không thêm lời dẫn thừa. Trả lời bằng tiếng Việt.`;
+
+  // ── Build messages với history ─────────────────────────────────────
+  const messages = [
+    { role: 'system', content: systemMsg },
+    // Đưa history vào để GPT hiểu ngữ cảnh câu hỏi
+    ...(history || []).slice(-6).map(m => ({
+      role:    m.role === 'assistant' ? 'assistant' : 'user',
+      content: m.content,
+    })),
+    // Dùng câu hỏi đã được expand (đầy đủ hơn) để GPT trả lời đúng
+    { role: 'user', content: question },
+  ];
+
+  const res = await getOpenAI().chat.completions.create({
+    model:       'gpt-4o-mini',
+    messages,
+    max_tokens:  800,
+    temperature: 0.1,
+  });
+
+  const answer = res.choices[0].message.content.trim();
+  const tokens = res.usage?.total_tokens || 0;
+
+  // ── Build sources list ─────────────────────────────────────────────
+  const seen    = new Set();
+  const sources = [];
+  for (const c of [...docChunks, ...productChunks]) {
+    const key = c.documentName;
+    if (!seen.has(key)) {
+      seen.add(key);
+      sources.push({
+        documentName:   c.isProduct ? `[Sản phẩm] ${c.documentName}` : c.documentName,
+        documentId:     c.documentId || '',
+        departmentCode: c.departmentCode || '',
+      });
+    }
+  }
+
+  console.log(`[RAG] Generated: ${tokens} tokens | ${sources.length} sources`);
+  return { answer, sources, tokens };
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// MAIN RAG QUERY — entry point từ routes/chat.js
+// ══════════════════════════════════════════════════════════════════════
+async function ragQuery({
+  question, departmentCode, departmentName,
+  systemPrompt, history, isMasterAdmin = false,
+}) {
+  // ── Bước 1: Expand câu hỏi ngắn/mơ hồ từ lịch sử ─────────────────
+  const expandedQ = await expandQuestion(question, history);
+
+  let docChunks     = [];
+  let productChunks = [];
+
+  try {
+    // ── Bước 2: Retrieve tài liệu ──────────────────────────────────
+    if (isMasterAdmin || departmentCode === 'ALL') {
+      docChunks = await retrieveAllChunks(expandedQ, TOP_K_DOC);
+      console.log(`[RAG] ALL depts: ${docChunks.length} doc chunks`);
+    } else {
+      docChunks = await retrieveChunks({
+        question:       expandedQ,
+        departmentCode,
+        topK:           TOP_K_DOC,
+      });
+      console.log(`[RAG] Dept ${departmentCode}: ${docChunks.length} doc chunks`);
+    }
+
+    // ── Bước 3: Retrieve sản phẩm song song ─────────────────────────
+    const rawProds = await retrieveProducts(expandedQ, TOP_K_PROD);
+    productChunks  = rawProds.map(p => ({
+      text:           p.text,
+      documentName:   p.meta?.name || 'Sản phẩm',
+      documentId:     p.meta?.product_id || '',
+      departmentCode: 'PRODUCTS',
+      isProduct:      true,
+      distance:       p.distance,
+    }));
+    console.log(`[RAG] Products: ${productChunks.length} chunks`);
+
+  } catch (e) {
+    console.error('[RAG] Retrieval error:', e.message);
+    return {
+      answer:  `Lỗi hệ thống tìm kiếm: ${e.message}. Kiểm tra ChromaDB đang chạy.`,
+      sources: [],
+      tokens:  0,
+    };
+  }
+
+  // ── Bước 4: Generate câu trả lời ──────────────────────────────────
+  return generateAnswer({
+    question:         expandedQ,   // dùng câu đã expand để generate
+    originalQuestion: question,
+    docChunks,
+    productChunks,
+    departmentName,
+    systemPrompt,
+    history,
+    isMasterAdmin,
+  });
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// INDEX DOCUMENT
+// ══════════════════════════════════════════════════════════════════════
 async function indexDocument({
   filePath, fileType, documentId, documentName, departmentCode, departmentId,
 }) {
-  console.log(`[RAG] Indexing: ${documentName}`)
-  const rawText = await extractText(filePath, fileType)
+  console.log(`[RAG] Indexing: ${documentName}`);
+  const rawText = await extractText(filePath, fileType);
   if (!rawText?.trim() || rawText.trim().length < 10) {
-    throw new Error('Không trích xuất được nội dung từ file')
+    throw new Error('Không trích xuất được nội dung từ file');
   }
-  const chunks = chunkText(rawText)
-  if (!chunks.length) throw new Error('File không có nội dung có thể xử lý')
-  console.log(`[RAG] ${chunks.length} chunks`)
+  const chunks = chunkText(rawText);
+  if (!chunks.length) throw new Error('File không có nội dung có thể xử lý');
+  console.log(`[RAG] ${chunks.length} chunks`);
 
-  const embeddings = await embedTexts(chunks)
+  const embeddings = await embedTexts(chunks);
 
-  let collection
+  let col;
   try {
-    collection = await getChroma().getOrCreateCollection({
-      name:     colName(departmentCode),
+    col = await getChroma().getOrCreateCollection({
+      name:     toColName(departmentCode),
       metadata: { department_code: departmentCode, department_id: departmentId },
-    })
+    });
   } catch (e) {
-    throw new Error(`Không kết nối ChromaDB: ${e.message}`)
+    throw new Error(`Không kết nối ChromaDB: ${e.message}`);
   }
 
-  try { await collection.delete({ where: { document_id: documentId } }) } catch {}
+  try { await col.delete({ where: { document_id: documentId } }); } catch {}
 
-  await collection.add({
+  await col.add({
     ids:        chunks.map((_, i) => `${documentId}_chunk_${i}`),
     embeddings,
     documents:  chunks,
@@ -149,268 +474,36 @@ async function indexDocument({
       department_id:   departmentId,
       chunk_index:     i,
     })),
-  })
+  });
 
-  console.log(`[RAG] Indexed ${chunks.length} chunks → ${colName(departmentCode)}`)
-  return { chunkCount: chunks.length, collectionName: colName(departmentCode) }
+  console.log(`[RAG] ✓ Indexed ${chunks.length} chunks → ${toColName(departmentCode)}`);
+  return { chunkCount: chunks.length, collectionName: toColName(departmentCode) };
 }
 
-// ─── DELETE DOCUMENT ──────────────────────────────────────────────────────────
+// ══════════════════════════════════════════════════════════════════════
+// DELETE DOCUMENT
+// ══════════════════════════════════════════════════════════════════════
 async function deleteDocument({ documentId, departmentCode }) {
   try {
-    const col = await getChroma().getCollection({ name: colName(departmentCode) })
-    await col.delete({ where: { document_id: documentId } })
-    console.log(`[RAG] Deleted ${documentId}`)
+    const col = await getChroma().getCollection({ name: toColName(departmentCode) });
+    await col.delete({ where: { document_id: documentId } });
+    console.log(`[RAG] Deleted doc: ${documentId}`);
   } catch (e) {
-    console.warn('[RAG] deleteDocument:', e.message)
+    console.warn('[RAG] deleteDocument:', e.message);
   }
 }
 
-// ─── RETRIEVE CHUNKS (1 phòng ban) ───────────────────────────────────────────
-async function retrieveChunks({ question, departmentCode, topK = TOP_K_DOC }) {
-  let col
-  try { col = await getChroma().getCollection({ name: colName(departmentCode) }) }
-  catch { return [] }
-
-  const count = await col.count()
-  if (!count) return []
-
-  const [qEmbed] = await embedTexts([question])
-  const res = await col.query({
-    queryEmbeddings: [qEmbed],
-    nResults:        Math.min(topK, count),
-    include:         ['documents', 'metadatas', 'distances'],
-  })
-
-  if (!res.documents?.[0]?.length) return []
-
-  const chunks = res.documents[0].map((doc, i) => ({
-    text:           doc,
-    documentName:   res.metadatas[0][i]?.document_name   || 'Tài liệu',
-    documentId:     res.metadatas[0][i]?.document_id,
-    departmentCode: res.metadatas[0][i]?.department_code || departmentCode,
-    distance:       res.distances[0][i] ?? 999,
-  }))
-
-  const relevant = chunks.filter(c => c.distance < DIST_DOC)
-  if (!relevant.length) {
-    console.log(`[RAG] Fallback top-${FALLBACK_TOP} (best dist=${chunks[0]?.distance?.toFixed(3)})`)
-    return chunks.slice(0, FALLBACK_TOP)
-  }
-  return relevant
-}
-
-// ─── RETRIEVE ALL CHUNKS (Master Admin) ──────────────────────────────────────
-async function retrieveAllChunks(question, topK = TOP_K_DOC) {
-  let deptCodes = ['HR', 'IT', 'SALES', 'ACCOUNTING', 'GENERAL']
-  try {
-    const Department = require('mongoose').model('Department')
-    const depts      = await Department.find({}, 'code').lean()
-    if (depts.length) deptCodes = depts.map(d => d.code)
-  } catch {}
-
-  let qEmbed
-  try { ;[qEmbed] = await embedTexts([question]) }
-  catch (e) { console.warn('[RAG] embed failed:', e.message); return [] }
-
-  const all = []
-  for (const code of deptCodes) {
-    try {
-      let col
-      try { col = await getChroma().getCollection({ name: colName(code) }) }
-      catch { continue }
-      const count = await col.count()
-      if (!count) continue
-      const res = await col.query({
-        queryEmbeddings: [qEmbed],
-        nResults:        Math.min(topK, count),
-        include:         ['documents', 'metadatas', 'distances'],
-      })
-      if (res.documents?.[0]) {
-        res.documents[0].forEach((doc, i) => {
-          all.push({
-            text:           doc,
-            documentName:   res.metadatas[0][i]?.document_name || 'Tài liệu',
-            documentId:     res.metadatas[0][i]?.document_id,
-            departmentCode: code,
-            distance:       res.distances[0][i] ?? 999,
-          })
-        })
-      }
-    } catch (e) { console.warn(`[RAG] Skip dept ${code}:`, e.message) }
-  }
-
-  all.sort((a, b) => a.distance - b.distance)
-  const relevant = all.filter(c => c.distance < DIST_DOC)
-  const result   = relevant.length ? relevant : all.slice(0, FALLBACK_TOP)
-  console.log(`[RAG] retrieveAllChunks: ${result.length} / ${deptCodes.length} depts`)
-  return result.slice(0, topK * 2)
-}
-
-// ─── RETRIEVE PRODUCTS ────────────────────────────────────────────────────────
-async function retrieveProducts(question, topK = TOP_K_PROD) {
-  try {
-    let col
-    try { col = await getChroma().getCollection({ name: 'tttn_products' }) }
-    catch { return [] }
-    const count = await col.count()
-    if (!count) return []
-    const [qEmbed] = await embedTexts([question])
-    const res = await col.query({
-      queryEmbeddings: [qEmbed],
-      nResults:        Math.min(topK, count),
-      include:         ['documents', 'metadatas', 'distances'],
-    })
-    if (!res.documents?.[0]) return []
-    return res.documents[0]
-      .map((doc, i) => ({ text: doc, meta: res.metadatas[0][i], distance: res.distances[0][i] ?? 999 }))
-      .filter(p => p.distance < DIST_PROD)
-  } catch (e) {
-    console.warn('[RAG] retrieveProducts:', e.message)
-    return []
-  }
-}
-
-// ─── GENERATE ANSWER ──────────────────────────────────────────────────────────
-async function generateAnswer({
-  question, docChunks = [], productChunks = [],
-  departmentName, systemPrompt, history = [], isMasterAdmin = false,
-}) {
-  const hasDoc  = docChunks.length > 0
-  const hasProd = productChunks.length > 0
-  const hasAny  = hasDoc || hasProd
-
-  // ── Xây context: tách 2 block rõ ràng để GPT không nhầm nguồn ──
-  let contextBlock = ''
-  if (hasDoc) {
-    contextBlock += '--- TÀI LIỆU NỘI BỘ ---\n'
-    contextBlock += docChunks.map(c => {
-      const dept = c.departmentCode ? ` [${c.departmentCode}]` : ''
-      return `[${c.documentName}${dept}]\n${c.text}`
-    }).join('\n\n')
-    contextBlock += '\n\n'
-  }
-  if (hasProd) {
-    contextBlock += '--- SẢN PHẨM ---\n'
-    contextBlock += productChunks.map(c => `[Sản phẩm: ${c.documentName}]\n${c.text}`).join('\n\n')
-  }
-
-  const base = systemPrompt
-    || `Bạn là trợ lý AI nội bộ${isMasterAdmin ? ' toàn hệ thống TTTN' : ` của phòng ${departmentName}`}.`
-
-  // ── System prompt: ngắn gọn, chuẩn RAG nội bộ, không bịa, không dài dòng ──
-  const systemMsg = hasAny
-    ? `${base}
-
-Nhiệm vụ: Trả lời câu hỏi của nhân viên dựa trên dữ liệu nội bộ được cung cấp bên dưới.
-
-Quy tắc:
-- Trả lời ngắn gọn, đúng trọng tâm. Câu hỏi đơn giản → trả lời 1–3 câu. Câu hỏi phức tạp → trả lời đủ ý, không thừa.
-- Cuối câu trả lời ghi nguồn trong ngoặc tròn:
-    Tài liệu → (Nguồn: tên_file)         ví dụ: (Nguồn: BÁO CÁO TTTN NHÓM 13.docx)
-    Sản phẩm → (Nguồn: Sản phẩm tên_sp)  ví dụ: (Nguồn: Sản phẩm MacBook M7)
-- KHÔNG nhầm nguồn: thông tin từ tài liệu không được ghi nguồn là sản phẩm và ngược lại.
-- KHÔNG bịa, KHÔNG suy đoán ngoài dữ liệu được cung cấp.
-- KHÔNG thêm câu mời chào, câu kết "Nếu bạn cần thêm...", hay bất kỳ lời dẫn không cần thiết.
-- Nếu dữ liệu chỉ có một phần liên quan, trả lời phần đó và nói rõ phần còn lại không có trong tài liệu.
-
-${contextBlock}`
-
-    : `${base}
-
-Không tìm thấy thông tin liên quan trong tài liệu nội bộ.
-Hãy trả lời ngắn gọn: thông báo không có dữ liệu, gợi ý người dùng liên hệ Admin hoặc bộ phận phụ trách, hoặc tự tra cứu bên ngoài nếu cần.
-KHÔNG thêm lời dẫn thừa. Trả lời bằng tiếng Việt.`
-
-  const messages = [
-    { role: 'system', content: systemMsg },
-    ...history.slice(-6).map(m => ({
-      role:    m.role === 'assistant' ? 'assistant' : 'user',
-      content: m.content,
-    })),
-    { role: 'user', content: question },
-  ]
-
-  const response = await getOpenAI().chat.completions.create({
-    model:       'gpt-4o-mini',
-    messages,
-    max_tokens:  800,   // giới hạn để tránh trả lời dài dòng
-    temperature: 0.1,
-  })
-
-  const answer = response.choices[0].message.content.trim()
-  const tokens = response.usage?.total_tokens || 0
-
-  // Dedup sources — tài liệu trước, sản phẩm sau
-  const seen    = new Set()
-  const sources = []
-  for (const c of [...docChunks, ...productChunks]) {
-    if (!seen.has(c.documentName)) {
-      seen.add(c.documentName)
-      sources.push({
-        documentName:   c.isProduct ? `[Sản phẩm] ${c.documentName}` : c.documentName,
-        documentId:     c.documentId,
-        departmentCode: c.departmentCode,
-      })
-    }
-  }
-
-  console.log(`[RAG] Generated: ${tokens} tokens | ${sources.length} sources`)
-  return { answer, sources, tokens }
-}
-
-// ─── MAIN RAG QUERY ───────────────────────────────────────────────────────────
-async function ragQuery({
-  question, departmentCode, departmentName,
-  systemPrompt, history, isMasterAdmin = false,
-}) {
-  let docChunks     = []
-  let productChunks = []
-
-  try {
-    if (isMasterAdmin || departmentCode === 'ALL') {
-      docChunks = await retrieveAllChunks(question, TOP_K_DOC)
-      console.log(`[RAG] ALL depts: ${docChunks.length} doc chunks`)
-    } else {
-      docChunks = await retrieveChunks({ question, departmentCode, topK: TOP_K_DOC })
-      console.log(`[RAG] Dept ${departmentCode}: ${docChunks.length} doc chunks`)
-    }
-
-    const rawProds = await retrieveProducts(question, TOP_K_PROD)
-    productChunks  = rawProds.map(p => ({
-      text:           p.text,
-      documentName:   p.meta?.name || 'Sản phẩm',
-      documentId:     p.meta?.product_id,
-      departmentCode: 'PRODUCTS',
-      isProduct:      true,
-      distance:       p.distance,
-    }))
-    console.log(`[RAG] Products: ${productChunks.length} chunks`)
-
-  } catch (e) {
-    console.error('[RAG] Retrieval error:', e.message)
-    return {
-      answer:  `Lỗi hệ thống tìm kiếm: ${e.message}. Kiểm tra ChromaDB đang chạy.`,
-      sources: [],
-      tokens:  0,
-    }
-  }
-
-  return generateAnswer({
-    question, docChunks, productChunks,
-    departmentName, systemPrompt, history, isMasterAdmin,
-  })
-}
-
-// ─── INDEX PRODUCT ────────────────────────────────────────────────────────────
+// ══════════════════════════════════════════════════════════════════════
+// INDEX PRODUCT
+// ══════════════════════════════════════════════════════════════════════
 async function indexProduct(product) {
   try {
     const col = await getChroma().getOrCreateCollection({
       name: 'tttn_products', metadata: { type: 'products' },
-    })
-    try { await col.delete({ where: { product_id: product._id.toString() } }) } catch {}
+    });
+    try { await col.delete({ where: { product_id: product._id.toString() } }); } catch {}
 
-    const fmt  = n => (n && n > 0) ? new Intl.NumberFormat('vi-VN').format(n) + ' VNĐ' : 'Liên hệ'
+    const fmt  = n => (n && n > 0) ? new Intl.NumberFormat('vi-VN').format(n) + ' VNĐ' : 'Liên hệ';
     const text = [
       `Tên sản phẩm: ${product.name}`,
       `Thương hiệu: ${product.brand     || ''}`,
@@ -419,9 +512,9 @@ async function indexProduct(product) {
       `Giá: ${fmt(product.price)}`,
       `Tồn kho: ${product.stock ?? 0} sản phẩm`,
       product.description ? `Mô tả: ${product.description}` : null,
-    ].filter(Boolean).join('\n')
+    ].filter(Boolean).join('\n');
 
-    const [embedding] = await embedTexts([text])
+    const [embedding] = await embedTexts([text]);
     await col.add({
       ids:        [product._id.toString()],
       embeddings: [embedding],
@@ -435,24 +528,29 @@ async function indexProduct(product) {
         price:      Number(product.price) || 0,
         stock:      Number(product.stock) || 0,
       }],
-    })
-    console.log(`[RAG] Product indexed: ${product.name}`)
+    });
+    console.log(`[RAG] Product indexed: ${product.name}`);
   } catch (e) {
-    console.warn('[RAG] indexProduct error:', e.message)
+    console.warn('[RAG] indexProduct error:', e.message);
   }
 }
 
-// ─── DELETE PRODUCT ───────────────────────────────────────────────────────────
+// ══════════════════════════════════════════════════════════════════════
+// DELETE PRODUCT
+// ══════════════════════════════════════════════════════════════════════
 async function deleteProduct(productId) {
   try {
-    const col = await getChroma().getCollection({ name: 'tttn_products' })
-    await col.delete({ where: { product_id: productId.toString() } })
-    console.log(`[RAG] Product deleted: ${productId}`)
+    const col = await getChroma().getCollection({ name: 'tttn_products' });
+    await col.delete({ where: { product_id: productId.toString() } });
+    console.log(`[RAG] Product deleted: ${productId}`);
   } catch (e) {
-    console.warn('[RAG] deleteProduct error:', e.message)
+    console.warn('[RAG] deleteProduct error:', e.message);
   }
 }
 
+// ══════════════════════════════════════════════════════════════════════
+// EXPORTS — interface không đổi, routes/ không cần sửa
+// ══════════════════════════════════════════════════════════════════════
 module.exports = {
   ragQuery,
   indexDocument,
@@ -464,4 +562,4 @@ module.exports = {
   extractText,
   chunkText,
   embedTexts,
-}
+};
