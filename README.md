@@ -158,7 +158,7 @@ NODE_ENV=development
 PORT=5000
 ```
 
-> ⚠️ Thay `MONGODB_URI` bằng connection string thật của bạn từ MongoDB Atlas.
+>  Thay `MONGODB_URI` bằng connection string thật của bạn từ MongoDB Atlas.
 
 **Tạo nhanh bằng PowerShell (Windows):**
 ```powershell
@@ -175,11 +175,11 @@ npm run dev
 
 Kết quả thành công:
 ```
-✅ MongoDB Atlas connected: ...
-🌱 Bắt đầu seed database...
-✅ Đã tạo 4 phòng ban
-✅ Đã tạo master admin: admin@tttn.vn / Admin@123456
-🚀 Backend running on port 5000
+ MongoDB Atlas connected: ...
+ Bắt đầu seed database...
+ Đã tạo 4 phòng ban
+ Đã tạo master admin: admin@tttn.vn / Admin@123456
+ Backend running on port 5000
 ```
 
 ### Bước 3 — Cài và chạy Frontend
@@ -377,35 +377,35 @@ Base URL: `http://localhost:5000/api`
 "MONGODB_URI=mongodb+srv://..." | Set-Content .env -Encoding utf8
 ```
 
-### ❌ `Cannot find module './store/authStore'`
+###  `Cannot find module './store/authStore'`
 **Nguyên nhân:** File `src/store/authStore.js` bị thiếu.
 
 **Fix:** File này có trong project. Đảm bảo giải nén đúng thư mục.
 
-### ❌ Vite lỗi import path
+###  Vite lỗi import path
 **Nguyên nhân:** Có thể xuất hiện folder tên `{auth,chat,...}` do lỗi `mkdir` brace expansion trên Linux.
 
 **Fix:** Xóa các folder tên lạ đó đi, chúng là artifact lỗi, không cần thiết.
 
-### ❌ Đăng ký không hoạt động
+###  Đăng ký không hoạt động
 **Nguyên nhân:** Backend chưa có route `/auth/register`.
 
 **Fix:** Route đã được thêm vào file `backend/src/routes/auth.js` trong phiên bản này.
 
-### ❌ Upload ảnh sản phẩm không hoạt động
+###  Upload ảnh sản phẩm không hoạt động
 **Nguyên nhân:** Backend route `/products` cần hỗ trợ `multipart/form-data` với field `image`.
 
 **Kiểm tra:** `backend/src/routes/products.js` phải dùng `multer` middleware.
 
-### ❌ Chọn phòng ban khi upload tài liệu không hiện dropdown
+### Chọn phòng ban khi upload tài liệu không hiện dropdown
 **Nguyên nhân:** Logic cũ chỉ hiện dropdown với `master_admin` nhưng không fetch departments trước.
 
 **Fix:** Đã sửa — dropdown hiện với `master_admin` và user chưa có phòng ban. Data departments được fetch khi mở trang.
 
-### ❌ Frontend chạy ở port khác (3000 thay vì 5173)
+###  Frontend chạy ở port khác (3000 thay vì 5173)
 Kiểm tra `vite.config.js`, mặc định Vite dùng **5173**. Nếu thấy port 3000 là do đã config custom.
 
-### ❌ CORS error khi frontend gọi API
+###  CORS error khi frontend gọi API
 **Fix:** `backend/src/server.js` phải có:
 ```js
 app.use(cors({ origin: ['http://localhost:5173', 'http://localhost:3000'] }))
@@ -430,5 +430,6 @@ Cần tạo file `.env` ở thư mục gốc trước khi chạy Docker.
 - **Token storage:** Access token & refresh token lưu trong `localStorage` key `tttn-auth` (Zustand persist). Interceptor axios tự đọc và tự refresh khi nhận 401.
 - **Seed data:** Chỉ chạy 1 lần khi database rỗng. Logic check `User.countDocuments() === 0`.
 - **AI Service:** Là microservice độc lập, backend gọi qua HTTP. Nếu AI Service down, chat vẫn tạo được session nhưng không nhận được phản hồi AI.
-#   c h a t b o t r a g  
+#   c h a t b o t r a g 
+ 
  
